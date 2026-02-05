@@ -11,15 +11,32 @@ import requests
 API_URL = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
 API_KEY = "SEDIA"
 
-KEYWORDS = [
-    "photo", "photography", "video", "videography", "audiovisual",
-    "content", "communication", "social media", "campaign",
+# Match if ANY of these prefixes match (OR), e.g. 7934xxxx or 7996xxxx etc.
+CPV_PREFIXES = [
+    "793",   # market research/advertising/marketing (broad)
+    "7934",  # advertising/marketing services (narrower)
+    "794",   # business/management/PR (broad)
+    "7941",  # PR/communications (narrower)
+    "799",   # miscellaneous business services (broad)
+    "7996",  # photographic services (narrower)
+    "921",   # film/video services
+    "922",   # radio/television services
+    "923",   # entertainment-related services (sometimes used)
+    "798",   # publishing/printing/related (sometimes used for content)
 ]
-CPV_PREFIXES = ["7996", "921"]
+
+# Optional keyword match (kept on; CPV match alone is enough)
+KEYWORDS = [
+    "photo", "photography", "photographer",
+    "video", "videography", "filming", "film",
+    "audiovisual", "audio-visual",
+    "content", "campaign", "communication", "communications",
+    "social media", "digital", "storytelling",
+]
 
 PAGE_SIZE = 50
-MAX_PAGES = 30
-DAYS_BACK = 14
+MAX_PAGES = 40
+DAYS_BACK = 30
 
 STATE_FILE = Path("sent_ids.json")
 
@@ -86,6 +103,17 @@ def fetch_page(page_number: int) -> dict:
     return r.json()
 
 
+def extract_items(data: dict) -> list[dict]:
+    if isinstance(data.get("results"), list):
+        return data["results"]
+    if isinstance(data.get("hits"), list):
+        return data["hits"]
+    rl = data.get("resultList")
+    if isinstance(rl, dict) and isinstance(rl.get("result"), list):
+        return rl["result"]
+    return []
+
+
 def send_email(matches: list[dict]) -> bool:
     email_to = os.environ.get("EMAIL_TO", "").strip()
     if not email_to:
@@ -109,9 +137,9 @@ def send_email(matches: list[dict]) -> bool:
     lines = []
     for m in matches:
         lines.append(m["title"])
-        lines.append(m["url"])
         if m.get("cpv"):
             lines.append(f"CPV: {m['cpv']}")
+        lines.append(m["url"])
         lines.append("")
 
     msg.set_content("\n".join(lines).strip() + "\n")
@@ -122,18 +150,6 @@ def send_email(matches: list[dict]) -> bool:
         s.send_message(msg)
 
     return True
-
-
-def extract_items(data: dict) -> list[dict]:
-    if isinstance(data.get("results"), list):
-        return data["results"]
-    if isinstance(data.get("hits"), list):
-        return data["hits"]
-    # fallback: some variants nest under "resultList"
-    rl = data.get("resultList")
-    if isinstance(rl, dict) and isinstance(rl.get("result"), list):
-        return rl["result"]
-    return []
 
 
 def main() -> None:
@@ -148,9 +164,7 @@ def main() -> None:
 
         for it in items:
             item_id = str(it.get("id") or "").strip()
-            if not item_id:
-                continue
-            if item_id in seen:
+            if not item_id or item_id in seen:
                 continue
 
             title = (it.get("title") or "").strip()
@@ -158,7 +172,8 @@ def main() -> None:
             cpv = it.get("cpvCode")
             url = (it.get("url") or it.get("link") or "").strip()
 
-            if kw_match(f"{title}\n{desc}") or cpv_match(cpv):
+            # include if CPV matches OR keywords match
+            if cpv_match(cpv) or kw_match(f"{title}\n{desc}"):
                 matches.append({"id": item_id, "title": title, "url": url, "cpv": cpv})
 
         time.sleep(0.15)
@@ -168,12 +183,11 @@ def main() -> None:
         return
 
     for m in matches:
-        print(f"- {m['title']} | {m['url']}")
+        print(f"- {m['title']} | CPV: {m.get('cpv')} | {m['url']}")
 
     emailed = send_email(matches)
     print(f"TOTAL MATCHES (last {DAYS_BACK} days): {len(matches)} | emailed={emailed}")
 
-    # Mark as seen regardless of email (so you don't re-process the same 14-day window every run)
     for m in matches:
         seen.add(m["id"])
     save_seen(seen)
