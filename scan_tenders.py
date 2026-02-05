@@ -13,43 +13,47 @@ from urllib3.util.retry import Retry
 API_URL = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
 API_KEY = "SEDIA"
 
-# ---- What we want: actual tenders on the portal (human pages), NOT topicDetails/*.json
-PORTAL_URL_MUST_CONTAIN = "/portal/screen/opportunities/calls-for-tenders/"
+# --- Tuning
+PAGE_SIZE = 50
+MAX_PAGES = 10            # discovery: keep it small/fast
+DAYS_BACK = 365           # discovery: wide window
 
-# ---- Procurement vs funding:
-# In this API, values vary, but earlier you got topicDetails with type "2".
-# We keep type filter loose and use the URL filter as the real guardrail.
-SEARCH_TYPES = []  # keep empty, rely on URL filter (safer)
-SEARCH_STATUSES = []  # optional; leave empty
-
-# ---- Matching (client-side): keyword OR CPV prefix
+# --- Match rules (after we identify procurement dataset)
 KEYWORDS = [
-    "photo", "photography", "photographer",
-    "video", "videography", "videographer",
-    "filming", "film production", "video production",
-    "audiovisual", "audio-visual", "visual",
-    "content creation", "creative services",
-    "communication campaign", "campaign",
-    "social media content", "media content",
-    "graphic design", "design services",
+    "photograph", "photography", "photo shoot", "photographic",
+    "video production", "videography", "filming", "film production",
+    "audiovisual", "audio-visual",
+    "communication campaign", "awareness campaign",
+    "social media content", "content creation",
+    "graphic design", "visual identity", "creative services",
+    "post-production", "editing",
 ]
 
 CPV_PREFIXES = [
-    "7996",    # photographic services
-    "921",     # motion picture and video services
-    "7934",    # advertising and marketing
-    "79416",   # PR services
-    "798",     # printing/design-related
+    "7996",   # photographic services
+    "921",    # motion picture and video services
+    "7934",   # advertising and marketing
+    "79416",  # public relations
 ]
-
-PAGE_SIZE = 50
-MAX_PAGES = 40
-DAYS_BACK = 180  # longer test window
 
 STATE_FILE = Path("sent_ids.json")
 
-FORCE_EMAIL_ALL = os.environ.get("FORCE_EMAIL_ALL", "0") == "1"
-IGNORE_SEEN = os.environ.get("IGNORE_SEEN", "0") == "1"
+# --- Modes (set as GitHub Actions variables / secrets)
+DISCOVER = os.environ.get("DISCOVER", "0") == "1"          # print dataset/url stats and exit
+IGNORE_SEEN = os.environ.get("IGNORE_SEEN", "0") == "1"    # treat everything as new
+FORCE_EMAIL_ALL = os.environ.get("FORCE_EMAIL_ALL", "0") == "1"  # email even if already seen
+
+# --- After discovery, set ONE of these to narrow to procurement dataset
+# Example (after you see them in logs): "Calls for tenders", "Procurement", "TED", etc.
+ONLY_DATABASE_LABELS = [
+    # "Calls for tenders",
+    # "Procurement",
+]
+
+# Optional: keep only results whose URL contains any of these (leave empty until discovery proves it)
+URL_MUST_CONTAIN_ANY = [
+    # "/portal/screen/opportunities/calls-for-tenders/",
+]
 
 
 def make_session() -> requests.Session:
@@ -188,23 +192,13 @@ def fetch_page(sess: requests.Session, page_number: int) -> dict:
         "pageNumber": page_number,
     }
 
-    must = []
-    if SEARCH_TYPES:
-        must.append({"terms": {"type": SEARCH_TYPES}})
-    if SEARCH_STATUSES:
-        must.append({"terms": {"status": SEARCH_STATUSES}})
-
-    # Accept either startDate or publicationDate
-    date_should = [
-        {"range": {"startDate": {"gte": f"now-{DAYS_BACK}d/d", "lte": "now"}}},
-        {"range": {"publicationDate": {"gte": f"now-{DAYS_BACK}d/d", "lte": "now"}}},
-    ]
-
     body = {
         "query": {
             "bool": {
-                "must": must,
-                "should": date_should,
+                "should": [
+                    {"range": {"startDate": {"gte": f"now-{DAYS_BACK}d/d", "lte": "now"}}},
+                    {"range": {"publicationDate": {"gte": f"now-{DAYS_BACK}d/d", "lte": "now"}}},
+                ],
                 "minimum_should_match": 1,
             }
         },
@@ -230,7 +224,8 @@ def send_email(items: list[dict]) -> None:
 
     lines = []
     for it in items:
-        lines.append(f"{it['title']}\nCPV: {', '.join(it['cpv']) if it['cpv'] else 'None'}\n{it['url']}\n")
+        cpv_txt = ", ".join(it["cpv"]) if it["cpv"] else "None"
+        lines.append(f"{it['title']}\nCPV: {cpv_txt}\n{it['url']}\n")
 
     msg.set_content("\n".join(lines))
 
@@ -242,9 +237,26 @@ def send_email(items: list[dict]) -> None:
     print(f"Email sent to {to_addr} ({len(items)} items).")
 
 
+def url_allowed(url: str) -> bool:
+    if not url:
+        return False
+    if URL_MUST_CONTAIN_ANY:
+        return any(fragment in url for fragment in URL_MUST_CONTAIN_ANY)
+    return True
+
+
+def db_label(item: dict) -> str:
+    # observed keys earlier: databaseLabel / database in top-level
+    return norm(item.get("databaseLabel") or item.get("database") or "").strip()
+
+
 def main() -> None:
     seen = set() if IGNORE_SEEN else load_seen()
     sess = make_session()
+
+    # Discovery stats
+    db_counts = {}
+    url_prefix_counts = {}
 
     all_matches = []
     new_matches = []
@@ -258,8 +270,25 @@ def main() -> None:
 
         for item in items:
             url = best_url(item)
-            if PORTAL_URL_MUST_CONTAIN not in url:
-                continue  # hard block topicDetails/*.json etc.
+            title = best_title(item)
+            dbl = db_label(item)
+
+            if DISCOVER:
+                if dbl:
+                    db_counts[dbl] = db_counts.get(dbl, 0) + 1
+                if url:
+                    # bucket by first ~60 chars
+                    pref = url[:60]
+                    url_prefix_counts[pref] = url_prefix_counts.get(pref, 0) + 1
+                continue
+
+            # After discovery: keep only desired datasets (if set)
+            if ONLY_DATABASE_LABELS:
+                if dbl not in ONLY_DATABASE_LABELS:
+                    continue
+
+            if not url_allowed(url):
+                continue
 
             item_id = norm(item.get("id") or item.get("reference") or url).strip()
             if not item_id:
@@ -274,9 +303,10 @@ def main() -> None:
 
             row = {
                 "id": item_id,
-                "title": best_title(item),
+                "title": title,
                 "url": url,
                 "cpv": extract_cpv(item),
+                "db": dbl,
                 "kw": is_kw,
                 "cpv_hit": is_cpv,
             }
@@ -287,16 +317,28 @@ def main() -> None:
 
         time.sleep(0.25)
 
+    if DISCOVER:
+        print("\n=== DISCOVER: databaseLabel counts (top) ===")
+        for k, v in sorted(db_counts.items(), key=lambda kv: kv[1], reverse=True)[:30]:
+            print(f"{v:>5}  {k}")
+
+        print("\n=== DISCOVER: url prefix buckets (top) ===")
+        for k, v in sorted(url_prefix_counts.items(), key=lambda kv: kv[1], reverse=True)[:30]:
+            print(f"{v:>5}  {k}")
+        print("\nDISCOVER done. Now set ONLY_DATABASE_LABELS and/or URL_MUST_CONTAIN_ANY based on this output.")
+        return
+
     if not all_matches:
-        print("TOTAL MATCHES: 0 (portal tenders only; none matched keywords/CPV in window)")
+        print("TOTAL MATCHES: 0 (after dataset/url filters + keyword/CPV matching)")
     else:
         print(f"TOTAL MATCHES (last {DAYS_BACK} days): {len(all_matches)}")
-        for m in all_matches[:200]:
+        for m in all_matches[:100]:
+            cpv_txt = ", ".join(m["cpv"]) if m["cpv"] else "None"
             print(f"- {m['title']}")
-            print(f"  CPV: {', '.join(m['cpv']) if m['cpv'] else 'None'} | kw={m['kw']} cpv_hit={m['cpv_hit']}")
+            print(f"  db={m['db']} | CPV: {cpv_txt} | kw={m['kw']} cpv_hit={m['cpv_hit']}")
             print(f"  {m['url']}")
-        if len(all_matches) > 200:
-            print(f"... printed first 200 of {len(all_matches)} matches")
+        if len(all_matches) > 100:
+            print(f"... printed first 100 of {len(all_matches)} matches")
 
     if FORCE_EMAIL_ALL:
         if all_matches:
