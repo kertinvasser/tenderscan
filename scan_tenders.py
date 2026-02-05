@@ -10,17 +10,20 @@ import requests
 API_URL = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
 API_KEY = "SEDIA"
 
-# Pull window
-DAYS_BACK = 60  # bump this while testing
+# Pull window (testing)
+DAYS_BACK = 60
 PAGE_SIZE = 50
 MAX_PAGES = 20
 
+# Networking hardening
+TIMEOUT_SECONDS = 60
+MAX_RETRIES = 6          # per page
+BACKOFF_BASE = 1.2       # exponential backoff base
+BACKOFF_JITTER = 0.4     # add randomness to avoid thundering herd
+
 STATE_FILE = Path("sent_ids.json")
 
-# Keyword matching: regex patterns (case-insensitive)
-# Goal: catch photo/video/content/campaign production WITHOUT matching "photonics"/"photovoltaic" etc.
 KEYWORD_PATTERNS = [
-    # photo / photography
     r"\bphotograph(y|er|ic|ing)\b",
     r"\bphoto(s)?\b",
     r"\bphoto[- ]?(shoot|shooting|session|coverage|reportage|production)\b",
@@ -29,8 +32,6 @@ KEYWORD_PATTERNS = [
     r"\bvisual(s)?\b",
     r"\bvisual[- ]?(asset(s)?|material(s)?|content|identity|campaign)\b",
     r"\bbrand[- ]?(asset(s)?|content|campaign)\b",
-
-    # video / audiovisual
     r"\bvideo(s)?\b",
     r"\bvideograph(y|er|ic|ing)\b",
     r"\bfilm(making|maker|ing)?\b",
@@ -40,8 +41,6 @@ KEYWORD_PATTERNS = [
     r"\bediting\b",
     r"\bcolour[- ]?grading\b|\bcolor[- ]?grading\b",
     r"\bsubtitl(e|ing|es)\b|\bcaption(s|ing)?\b",
-
-    # comms / campaigns (where photo/video is usually embedded)
     r"\bcommunication(s)?\b",
     r"\bcommunications?\s+campaign\b",
     r"\bawareness\s+campaign\b",
@@ -51,8 +50,6 @@ KEYWORD_PATTERNS = [
     r"\bdigital\s+campaign\b",
     r"\bcontent\s+creation\b|\bcontent\s+production\b",
     r"\bcreative\s+(services|agency|production|content)\b",
-
-    # design / print deliverables that often include visuals
     r"\bgraphic\s+design\b",
     r"\bdesign\s+services\b",
     r"\blayout\b",
@@ -61,7 +58,6 @@ KEYWORD_PATTERNS = [
     r"\bposter(s)?\b|\bbanner(s)?\b|\bbrochure(s)?\b|\bleaflet(s)?\b",
 ]
 
-# Exclude common scientific false positives that contain "photo" as a substring
 NEGATIVE_PATTERNS = [
     r"\bphotonics?\b",
     r"\bphotonic\b",
@@ -75,6 +71,8 @@ NEGATIVE_PATTERNS = [
 
 KW_RE = re.compile("|".join(KEYWORD_PATTERNS), re.IGNORECASE)
 NEG_RE = re.compile("|".join(NEGATIVE_PATTERNS), re.IGNORECASE)
+
+SESSION = requests.Session()
 
 
 def load_seen():
@@ -101,10 +99,18 @@ def kw_match(text: str) -> bool:
     return KW_RE.search(text) is not None
 
 
-def fetch_page(page_number: int) -> dict:
+def _sleep_backoff(attempt: int):
+    # attempt: 1..MAX_RETRIES
+    base = BACKOFF_BASE ** (attempt - 1)
+    jitter = 1 + (BACKOFF_JITTER * (0.5 - (time.time() % 1)))  # deterministic-ish jitter
+    delay = min(25, base * jitter)
+    time.sleep(max(0.5, delay))
+
+
+def fetch_page(page_number: int) -> dict | None:
     params = {
         "apiKey": API_KEY,
-        "text": "***",  # keep broad; we filter locally with KW_RE
+        "text": "***",
         "pageSize": PAGE_SIZE,
         "pageNumber": page_number,
     }
@@ -129,9 +135,29 @@ def fetch_page(page_number: int) -> dict:
         "sort": [{"field": "startDate", "order": "DESC"}],
     }
 
-    r = requests.post(API_URL, params=params, json=body, timeout=45)
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = SESSION.post(API_URL, params=params, json=body, timeout=TIMEOUT_SECONDS)
+            r.raise_for_status()
+            return r.json()
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            print(f"PAGE {page_number}: network error on attempt {attempt}/{MAX_RETRIES}: {e}")
+            if attempt < MAX_RETRIES:
+                _sleep_backoff(attempt)
+                continue
+            print(f"PAGE {page_number}: giving up after {MAX_RETRIES} attempts.")
+            return None
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            print(f"PAGE {page_number}: HTTP error {status} on attempt {attempt}/{MAX_RETRIES}: {e}")
+            # Retry only on likely transient statuses
+            if status in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+                _sleep_backoff(attempt)
+                continue
+            return None
+        except Exception as e:
+            print(f"PAGE {page_number}: unexpected error: {e}")
+            return None
 
 
 def send_email(matches):
@@ -141,7 +167,7 @@ def send_email(matches):
         return
 
     msg = EmailMessage()
-    msg["Subject"] = f"EU Funding & Tenders keyword matches: {len(matches)} (last {DAYS_BACK}d)"
+    msg["Subject"] = f"EU F&T keyword matches: {len(matches)} (last {DAYS_BACK}d)"
     msg["From"] = os.environ.get("EMAIL_FROM", "")
     msg["To"] = to_addr
 
@@ -167,9 +193,14 @@ def main():
     seen = load_seen()
     matches = []
     checked = 0
+    failed_pages = 0
 
     for page in range(1, MAX_PAGES + 1):
         data = fetch_page(page)
+        if data is None:
+            failed_pages += 1
+            # don’t kill the whole run; continue to next page
+            continue
 
         items = data.get("results") or data.get("hits") or []
         print(f"PAGE {page}: items={len(items)}")
@@ -184,7 +215,6 @@ def main():
 
             title = (it.get("title") or "").strip()
             url = (it.get("url") or "").strip()
-            # fields vary; use several candidates
             desc = (it.get("description") or it.get("summary") or "").strip()
             start_date = it.get("startDate") or it.get("publicationDate") or ""
 
@@ -204,33 +234,34 @@ def main():
 
         time.sleep(0.15)
 
-    # Show matches in logs (so you can see it even if email fails)
+    print(f"Checked {checked} items. Failed pages: {failed_pages}.")
+
     if not matches:
-        print(f"No keyword matches found in last {DAYS_BACK} days. Checked {checked} items.")
+        print(f"No keyword matches found in last {DAYS_BACK} days.")
         return
 
-    # Email only NEW ones (prevents spam)
     new_matches = [m for m in matches if m["new"]]
 
     print(f"TOTAL keyword matches (last {DAYS_BACK} days): {len(matches)}")
     print(f"NEW matches (not in sent_ids.json): {len(new_matches)}")
-    print("---- MATCH LIST (all) ----")
-    for m in matches[:200]:  # keep logs readable
+    print("---- MATCH LIST (all, first 200) ----")
+    for m in matches[:200]:
         print(m["title"])
         print(m["url"])
         if m.get("date"):
             print(f"date: {m['date']}")
         print("")
 
-    # Mark as seen (only new ones)
+    # mark seen + save
     for m in new_matches:
         seen.add(m["id"])
     save_seen(seen)
 
+    # send mail only for new
     if new_matches:
         send_email(new_matches)
     else:
-        print("No NEW matches to email (all matches were already seen).")
+        print("No NEW matches to email (all were already seen).")
 
 
 if __name__ == "__main__":
