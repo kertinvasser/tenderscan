@@ -1,14 +1,19 @@
+import json
 import time
+from pathlib import Path
+
 import requests
 
 API_URL = "https://api.tech.ec.europa.eu/search-api/prod/rest/search"
 API_KEY = "SEDIA"
 
 PAGE_SIZE = 50
-MAX_PAGES = 2  # keep small for debugging
+PAGE_NUMBER = 1
+
+SAMPLE_FILE = Path("sample_response.json")
 
 
-def extract_items(data: dict) -> list[dict]:
+def extract_items(data: dict):
     if isinstance(data.get("results"), list):
         return data["results"]
     if isinstance(data.get("hits"), list):
@@ -22,12 +27,11 @@ def extract_items(data: dict) -> list[dict]:
 def fetch_page(page_number: int) -> dict:
     params = {
         "apiKey": API_KEY,
-        "text": "*",  # wildcard
+        "text": "*",
         "pageSize": PAGE_SIZE,
         "pageNumber": page_number,
     }
 
-    # No date filter here. This is purely to prove we get items back.
     body = {
         "query": {
             "bool": {
@@ -36,8 +40,7 @@ def fetch_page(page_number: int) -> dict:
                     {"terms": {"status": ["31094501", "31094502"]}},
                 ]
             }
-        },
-        "sort": [{"field": "startDate", "order": "DESC"}],
+        }
     }
 
     r = requests.post(API_URL, params=params, json=body, timeout=30)
@@ -45,41 +48,40 @@ def fetch_page(page_number: int) -> dict:
     return r.json()
 
 
-def pick_url(it: dict) -> str:
-    return (it.get("url") or it.get("link") or "").strip()
+def pick_first(it: dict, keys: list[str]) -> str:
+    for k in keys:
+        v = it.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
 
 
 def main() -> None:
-    total_items = 0
-    printed = 0
+    data = fetch_page(PAGE_NUMBER)
+    SAMPLE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    print(f"Saved raw API response to: {SAMPLE_FILE}")
 
-    for page in range(1, MAX_PAGES + 1):
-        data = fetch_page(page)
-        items = extract_items(data)
-        print(f"PAGE {page}: items={len(items)}")
+    items = extract_items(data)
+    print(f"PAGE {PAGE_NUMBER}: items={len(items)}")
 
-        if not items:
-            break
+    if not items:
+        return
 
-        total_items += len(items)
+    first = items[0]
+    print("\nFIRST ITEM KEYS:")
+    print(sorted(list(first.keys())))
 
-        for it in items:
-            title = (it.get("title") or "").strip()
-            cpv = it.get("cpvCode")
-            url = pick_url(it)
-            start_date = it.get("startDate")
-            pub_date = it.get("publicationDate")
+    print("\nFIRST 5 ITEMS (best-guess fields):")
+    for it in items[:5]:
+        title = pick_first(it, ["title", "name", "topic", "callTitle", "metadataTitle"])
+        url = pick_first(it, ["url", "link", "webLink", "detailUrl", "detailsUrl"])
+        cpv = it.get("cpvCode") or it.get("cpv") or it.get("cpvs")
+        print(f"- title: {title or '[empty]'}")
+        print(f"  url:   {url or '[empty]'}")
+        print(f"  cpv:   {cpv}")
+        print("")
 
-            # print first 20 items only
-            if printed < 20:
-                print(f"- {title}")
-                print(f"  CPV: {cpv} | startDate: {start_date} | publicationDate: {pub_date}")
-                print(f"  {url}")
-                printed += 1
-
-        time.sleep(0.15)
-
-    print(f"TOTAL ITEMS RETURNED: {total_items}")
+    time.sleep(0.1)
 
 
 if __name__ == "__main__":
