@@ -112,8 +112,8 @@ def main():
 
         for it in items:
             item_id = str(it.get("id"))
-            if not item_id or item_id in seen:
-                continue
+            if not item_id:
+    continue
 
             title = it.get("title", "")
             desc = it.get("description", "")
