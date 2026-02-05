@@ -19,6 +19,7 @@ CPV_PREFIXES = ["7996", "921"]
 
 PAGE_SIZE = 50
 MAX_PAGES = 20
+DAYS_BACK = 14
 
 STATE_FILE = Path("sent_ids.json")
 
