@@ -54,17 +54,24 @@ def fetch_page(page_number):
         "pageNumber": page_number,
     }
 
-    body = {
-        "query": {
-            "bool": {
-                "must": [
-                    {"terms": {"type": ["2"]}},
-                    {"terms": {"status": ["31094501", "31094502"]}},
-                ]
-            }
-        },
-        "sort": [{"field": "startDate", "order": "DESC"}],
-    }
+ body = {
+    "query": {
+        "bool": {
+            "must": [
+                {"terms": {"type": ["2"]}},
+                {"terms": {"status": ["31094501", "31094502"]}},
+                {
+                    "range": {
+                        "startDate": {
+                            "gte": f"now-{DAYS_BACK}d/d",
+                            "lte": "now"
+                        }
+                    }
+                },
+            ]
+        }
+    },
+    "sort": [{"field": "startDate", "order": "DESC"}], }
 
     r = requests.post(API_URL, params=params, json=body, timeout=30)
     r.raise_for_status()
