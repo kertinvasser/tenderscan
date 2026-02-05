@@ -133,8 +133,7 @@ def main():
         seen.add(m["id"])
         print(m["title"], m["url"])
 
-    save_seen(seen)
-    send_email(matches)
+   print(f"TOTAL MATCHES (last {DAYS_BACK} days): {len(matches)}")
 
 
 if __name__ == "__main__":
